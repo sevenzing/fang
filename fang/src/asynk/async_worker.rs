@@ -1,13 +1,23 @@
-use crate::asynk::async_queue::AsyncQueueable;
-use crate::asynk::async_queue::DEFAULT_TASK_TYPE;
-use crate::asynk::async_runnable::AsyncRunnable;
-use crate::FangError;
-use crate::FangTaskState;
-use crate::Scheduled::*;
-use crate::Task;
-use crate::{RetentionMode, SleepParams};
+use crate::{
+    asynk::{
+        async_queue::{AsyncQueueable, DEFAULT_TASK_TYPE},
+        async_runnable::AsyncRunnable,
+    },
+    FangError, FangTaskState, RetentionMode,
+    Scheduled::*,
+    SleepParams, Task,
+};
+use lazy_static::lazy_static;
 use log::error;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 use typed_builder::TypedBuilder;
+use uuid::Uuid;
+
+lazy_static! {
+    static ref TASK_LOCKS: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+}
 
 /// it executes tasks only of task_type type, it sleeps when there are no tasks in the queue
 #[derive(TypedBuilder)]
@@ -101,12 +111,32 @@ where
                     let actual_task: Box<dyn AsyncRunnable> =
                         serde_json::from_value(task.metadata.clone())?;
 
+                    // take lock on task task.id
+                    let task_mutex = {
+                        let mut guard = TASK_LOCKS.lock().await;
+                        guard
+                            .entry(task.id)
+                            .or_insert_with(|| Arc::new(Mutex::new(())))
+                            .clone()
+                    };
+                    let _task_lock = match task_mutex.try_lock() {
+                        Ok(lock) => lock,
+                        Err(_) => {
+                            log::debug!(task_id = task.id, "failed to acquire task lock, skipping");
+                            return Ok(());
+                        }
+                    };
                     let cron = actual_task.cron();
 
                     self.sleep_params.maybe_reset_sleep_period();
 
                     // run scheduled task
-                    self.run(&task, &*actual_task).await?;
+                    let result = self.run(&task, &*actual_task).await;
+
+                    // optional: free memory from task lock
+                    let mut guard = TASK_LOCKS.lock().await;
+                    guard.remove(&task.id);
+                    result?;
 
                     // check if task is scheduled or not
                     if let Some(CronPattern(_)) = cron {
@@ -247,17 +277,16 @@ impl<'a> AsyncWorkerTest<'a> {
 #[cfg(test)]
 mod async_worker_tests {
     use super::AsyncWorkerTest;
-    use crate::asynk::async_queue::AsyncQueue;
-    use crate::asynk::async_queue::AsyncQueueable;
-    use crate::asynk::async_worker::Task;
-    use crate::asynk::AsyncRunnable;
-    use crate::FangError;
-    use crate::FangTaskState;
-    use crate::RetentionMode;
-    use crate::Scheduled;
+    use crate::{
+        asynk::{
+            async_queue::{AsyncQueue, AsyncQueueable},
+            async_worker::Task,
+            AsyncRunnable,
+        },
+        FangError, FangTaskState, RetentionMode, Scheduled,
+    };
     use async_trait::async_trait;
-    use chrono::Duration;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]
