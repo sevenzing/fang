@@ -122,7 +122,7 @@ where
                     let _task_lock = match task_mutex.try_lock() {
                         Ok(lock) => lock,
                         Err(_) => {
-                            log::debug!(task_id = task.id, "failed to acquire task lock, skipping");
+                            log::debug!("failed to acquire task lock for task {:?}, skipping", task.id);
                             return Ok(());
                         }
                     };
